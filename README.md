@@ -390,3 +390,329 @@ for step in range(1000):
 * **Scheduler** → trend/variance/reward-based updates for LR, momentum, dither.
 * **Loop** → gradient + adaptive update + stochastic dither injection.
 
+### PSUEDOCODE
+
+Perfect — let’s extend the stub into a **real differentiable subtractive synth** inside the AE-DDSP loop.
+We’ll keep it compact but functional:
+
+* **Oscillator** (sine/saw/square mix)
+* **ADSR envelope** (differentiable exponential curves)
+* **Low-pass filter** (biquad, differentiable)
+* **VCA** (amplitude control)
+
+This gives us a classic subtractive signal path:
+
+`Oscillator → Filter → VCA (with envelope)`
+
+---
+
+# 🔧 PyTorch Implementation
+
+```python
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import math
+
+
+# ------------------------------------------------------------
+# Utility: simple differentiable biquad low-pass filter
+# ------------------------------------------------------------
+def biquad_lowpass(x, cutoff, Q, sr=16000):
+    """
+    x: [B, T]
+    cutoff: scalar tensor (Hz)
+    Q: scalar tensor
+    """
+    # normalize
+    omega = 2 * math.pi * cutoff / sr
+    alpha = torch.sin(omega) / (2 * Q)
+
+    b0 = (1 - torch.cos(omega)) / 2
+    b1 = 1 - torch.cos(omega)
+    b2 = (1 - torch.cos(omega)) / 2
+    a0 = 1 + alpha
+    a1 = -2 * torch.cos(omega)
+    a2 = 1 - alpha
+
+    b0, b1, b2, a0, a1, a2 = [torch.tensor(v, device=x.device, dtype=x.dtype) for v in (b0, b1, b2, a0, a1, a2)]
+
+    y = torch.zeros_like(x)
+    x1 = x2 = y1 = y2 = torch.zeros(x.size(0), device=x.device, dtype=x.dtype)
+    for n in range(x.size(1)):
+        xn = x[:, n]
+        yn = (b0/a0)*xn + (b1/a0)*x1 + (b2/a0)*x2 - (a1/a0)*y1 - (a2/a0)*y2
+        y[:, n] = yn
+        x2, x1 = x1, xn
+        y2, y1 = y1, yn
+    return y
+
+
+# ------------------------------------------------------------
+# Differentiable Oscillator
+# ------------------------------------------------------------
+def oscillator(t, freq, mix_saw=0.5, mix_square=0.0):
+    """
+    t: time vector [T]
+    freq: tensor scalar
+    """
+    phase = 2 * math.pi * freq * t
+    sine = torch.sin(phase)
+    saw = 2 * (phase/(2*math.pi) % 1.0) - 1.0
+    square = torch.sign(sine)
+    wave = (1 - mix_saw - mix_square) * sine + mix_saw * saw + mix_square * square
+    return wave
+
+
+# ------------------------------------------------------------
+# ADSR Envelope (differentiable exponential shapes)
+# ------------------------------------------------------------
+def adsr_envelope(t, attack, decay, sustain, release, note_len=0.5):
+    env = torch.zeros_like(t)
+    # Attack
+    attack_mask = (t < attack)
+    env[attack_mask] = t[attack_mask]/attack
+    # Decay
+    decay_mask = (t >= attack) & (t < attack+decay)
+    env[decay_mask] = sustain + (1-sustain)*torch.exp(-(t[decay_mask]-attack)/decay)
+    # Sustain
+    sustain_mask = (t >= attack+decay) & (t < note_len)
+    env[sustain_mask] = sustain
+    # Release
+    release_mask = (t >= note_len)
+    env[release_mask] = sustain*torch.exp(-(t[release_mask]-note_len)/release)
+    return env
+
+
+# ------------------------------------------------------------
+# Subtractive Synth (Oscillator → Filter → VCA)
+# ------------------------------------------------------------
+class SubtractiveSynth(nn.Module):
+    def __init__(self, n_samples=16000, sr=16000):
+        super().__init__()
+        self.sr = sr
+        self.n_samples = n_samples
+
+        # Trainable parameters
+        self.freq = nn.Parameter(torch.tensor([220.0]))
+        self.mix_saw = nn.Parameter(torch.tensor([0.3]))
+        self.mix_square = nn.Parameter(torch.tensor([0.0]))
+
+        self.cutoff = nn.Parameter(torch.tensor([2000.0]))
+        self.res = nn.Parameter(torch.tensor([0.7]))
+
+        self.attack = nn.Parameter(torch.tensor([0.05]))
+        self.decay = nn.Parameter(torch.tensor([0.1]))
+        self.sustain = nn.Parameter(torch.tensor([0.7]))
+        self.release = nn.Parameter(torch.tensor([0.2]))
+
+        self.amp = nn.Parameter(torch.tensor([0.8]))
+
+    def forward(self):
+        device = self.freq.device
+        t = torch.linspace(0, self.n_samples/self.sr, self.n_samples, device=device)
+
+        # Oscillator
+        wave = oscillator(t, self.freq, self.mix_saw, self.mix_square).unsqueeze(0)  # [1, T]
+
+        # Envelope
+        env = adsr_envelope(t, self.attack, self.decay, self.sustain, self.release).unsqueeze(0)
+
+        # Multiply
+        sig = wave * env * self.amp
+
+        # Filter
+        y = biquad_lowpass(sig, self.cutoff, self.res, sr=self.sr)
+
+        return y
+```
+
+---
+
+# 🔑 How to Plug into AE-DDSP
+
+Replace the old `DifferentiableSynth` with `SubtractiveSynth` in the scaffold we built earlier:
+
+```python
+synth = SubtractiveSynth()
+feats = SpectralFeatures()
+scheduler = Scheduler()
+optimizer = torch.optim.SGD(synth.parameters(), lr=1e-3, momentum=0.9)
+
+target = synth()  # or load a target waveform
+
+for step in range(500):
+    loss, reward, α, μ, σ = ae_ddsp_step(synth, feats, scheduler, target, optimizer)
+    if step % 50 == 0:
+        print(f"{step}: loss={loss:.4f}, reward={reward:.3f}, α={α:.5f}, μ={μ:.3f}, σ={σ:.6f}")
+```
+
+---
+
+# ⚡ Notes
+
+* **Oscillator** supports blends of sine, saw, square.
+* **Envelope** is piecewise, continuous, differentiable almost everywhere.
+* **Filter** uses a simple biquad IIR. For efficiency you could swap to a differentiable FIR convolution or torchdsp.
+* **All parameters are trainable tensors** — the AE-DDSP scheduler can adapt them via gradient + evolutionary dither.
+
+### PSEUDOCODE
+
+Got it 🚀 — let’s design a **differentiable 6-operator FM synth** in PyTorch, inspired by the Yamaha DX7.
+We’ll keep it structured but still manageable for training inside your **AE-DDSP loop**.
+
+---
+
+# 🎛 Theory: FM Synth with 6 Operators
+
+* **Operator** = sine oscillator with frequency ratio, detune, and envelope.
+* Operators can be routed in **algorithms**: some modulate the frequency of others, some feed to the output mix.
+* The DX7 has 32 “algorithms” (routing diagrams). We’ll allow a flexible adjacency matrix to represent which operator modulates which.
+
+---
+
+# 🧩 Implementation in PyTorch
+
+```python
+import torch
+import torch.nn as nn
+import math
+
+
+# ------------------------------------------------------------
+# ADSR envelope (smooth, differentiable)
+# ------------------------------------------------------------
+def adsr(t, attack, decay, sustain, release, note_len=0.5):
+    env = torch.zeros_like(t)
+    # Attack
+    a_mask = t < attack
+    env[a_mask] = t[a_mask] / (attack + 1e-8)
+    # Decay
+    d_mask = (t >= attack) & (t < attack + decay)
+    env[d_mask] = sustain + (1 - sustain) * torch.exp(-(t[d_mask] - attack) / (decay + 1e-8))
+    # Sustain
+    s_mask = (t >= attack + decay) & (t < note_len)
+    env[s_mask] = sustain
+    # Release
+    r_mask = t >= note_len
+    env[r_mask] = sustain * torch.exp(-(t[r_mask] - note_len) / (release + 1e-8))
+    return env
+
+
+# ------------------------------------------------------------
+# Operator = sine oscillator + envelope
+# ------------------------------------------------------------
+class FMOperator(nn.Module):
+    def __init__(self, sr=16000, n_samples=16000):
+        super().__init__()
+        self.sr = sr
+        self.n_samples = n_samples
+
+        # Trainable parameters
+        self.freq_ratio = nn.Parameter(torch.tensor([1.0]))   # ratio to base freq
+        self.detune = nn.Parameter(torch.tensor([0.0]))       # Hz
+        self.output_gain = nn.Parameter(torch.tensor([0.5]))
+
+        # Envelope params
+        self.attack = nn.Parameter(torch.tensor([0.05]))
+        self.decay = nn.Parameter(torch.tensor([0.1]))
+        self.sustain = nn.Parameter(torch.tensor([0.7]))
+        self.release = nn.Parameter(torch.tensor([0.2]))
+
+    def forward(self, t, base_freq, modulation):
+        """
+        t: [T] time vector
+        base_freq: scalar tensor (Hz)
+        modulation: [B, T] modulation signal (phase offsets)
+        """
+        freq = base_freq * self.freq_ratio + self.detune
+        phase = 2 * math.pi * freq * t
+        env = adsr(t, self.attack, self.decay, self.sustain, self.release)
+        sig = torch.sin(phase + modulation) * env * self.output_gain
+        return sig
+
+
+# ------------------------------------------------------------
+# 6-Operator FM Synth
+# ------------------------------------------------------------
+class FMSynth6(nn.Module):
+    def __init__(self, sr=16000, n_samples=16000, algorithm=None):
+        super().__init__()
+        self.sr = sr
+        self.n_samples = n_samples
+
+        # 6 operators
+        self.ops = nn.ModuleList([FMOperator(sr, n_samples) for _ in range(6)])
+
+        # Algorithm routing matrix: [6, 6], entry (i,j)=1 means op j modulates op i
+        if algorithm is None:
+            # Simple default: op6→op5→op4→op3→op2→op1 (serial), op1 is output
+            mat = torch.zeros(6, 6)
+            for i in range(5):
+                mat[i, i+1] = 1
+            self.algorithm = nn.Parameter(mat, requires_grad=False)
+        else:
+            self.algorithm = nn.Parameter(algorithm, requires_grad=False)
+
+        # Trainable mix weights for final output
+        self.mix = nn.Parameter(torch.ones(6))
+
+    def forward(self, base_freq=220.0, note_len=0.5):
+        device = self.mix.device
+        t = torch.linspace(0, self.n_samples/self.sr, self.n_samples, device=device)
+
+        # storage for signals
+        sigs = [None]*6
+
+        # Compute operators in order
+        for i in reversed(range(6)):
+            # modulation = sum of outputs of modulators (according to algorithm)
+            mod_sources = []
+            for j in range(6):
+                if self.algorithm[i,j] == 1:
+                    if sigs[j] is None:
+                        # placeholder, will be filled once j is computed
+                        continue
+                    mod_sources.append(sigs[j])
+            modulation = sum(mod_sources) if mod_sources else torch.zeros_like(t)
+            sigs[i] = self.ops[i](t, torch.tensor(base_freq, device=device), modulation)
+
+        # Mix output from all ops with trainable weights
+        out = sum(w*s for w, s in zip(self.mix, sigs))
+        return out.unsqueeze(0)  # [1, T]
+```
+
+---
+
+# ⚡ Key Features
+
+* **6 operators** (each with ratio, detune, envelope, gain).
+* **Routing matrix** $[6,6]$ encodes algorithm (who modulates who).
+
+  * Example given: serial chain (6→5→4→3→2→1).
+  * You can set other algorithms by filling the matrix.
+* **Differentiable ADSR envelopes** scale operator amplitudes.
+* **Final output mix**: weighted sum of all operators.
+
+---
+
+# 🔑 How to use inside AE-DDSP
+
+```python
+synth = FMSynth6()
+feats = SpectralFeatures()
+scheduler = Scheduler()
+optimizer = torch.optim.SGD(synth.parameters(), lr=1e-3, momentum=0.9)
+
+target = synth(base_freq=220.0)  # or load a real target audio
+
+for step in range(200):
+    loss, reward, α, μ, σ = ae_ddsp_step(synth, feats, scheduler, target, optimizer)
+    if step % 50 == 0:
+        print(f"{step}: loss={loss:.4f}, reward={reward:.3f}, α={α:.5f}, μ={μ:.3f}, σ={σ:.6f}")
+```
+
+---
+
+✅ You now have a **6-operator differentiable FM synth** with routing flexibility. This can learn timbres, or be driven by spectral feature rewards in the AE-DDSP loop.
+
